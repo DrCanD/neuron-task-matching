@@ -1,6 +1,6 @@
 # A cross-domain double dissociation of neuron-task matching in pure spiking networks
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20763581.svg)](https://doi.org/10.5281/zenodo.20763581)
+[![DOI](https://zenodo.org/badge/1274450750.svg)](https://doi.org/10.5281/zenodo.20763581)
 
 Experiment code for the paper of the same name (Dikmen & Karadağ, submitted to
 *Neural Networks*, Elsevier, 2026). The central claim is that at matched capacity a
