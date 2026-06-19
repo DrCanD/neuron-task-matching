@@ -1,4 +1,5 @@
 # A cross-domain double dissociation of neuron-task matching in pure spiking networks
+[![DOI](https://zenodo.org/badge/1274450750.svg)](https://doi.org/10.5281/zenodo.20763581)
 
 Experiment code for the paper *A cross-domain double dissociation of neuron-task
 matching in pure spiking networks* by İsmail Can Dikmen and Teoman Karadağ
