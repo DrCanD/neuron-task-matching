@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the paper and the spiking-neuron library below."
+title: "A cross-domain double dissociation of neuron-task matching in pure spiking networks (experiment code)"
+type: software
+authors:
+  - family-names: Dikmen
+    given-names: İsmail Can
+    orcid: "https://orcid.org/0000-0002-7747-7777"
+    affiliation: "İstinye University"
+  - family-names: Karadağ
+    given-names: Teoman
+    orcid: "https://orcid.org/0000-0002-7682-7771"
+    affiliation: "İnönü University"
+repository-code: "https://github.com/DrCanD/neuron-task-matching"
+license: MIT
+references:
+  - type: article
+    title: "A cross-domain double dissociation of neuron-task matching in pure spiking networks"
+    authors:
+      - family-names: Dikmen
+        given-names: İsmail Can
+      - family-names: Karadağ
+        given-names: Teoman
+    status: submitted
+    journal: "Neural Networks"
+    publisher:
+      name: Elsevier
+    year: 2026
+  - type: software
+    title: "dikmen-spiking-neurons: A library of physics-motivated spiking neuron models"
+    authors:
+      - family-names: Dikmen
+        given-names: İsmail Can
+    doi: "10.5281/zenodo.20110833"
+    version: "v1.2.0"
+    year: 2026

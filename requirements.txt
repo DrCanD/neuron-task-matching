@@ -1,0 +1,19 @@
+# Core
+torch>=2.0
+numpy>=1.23
+scikit-learn>=1.1
+h5py>=3.7
+matplotlib>=3.6
+
+# Best-model hyperparameter search (experiments 03, 04)
+optuna>=3.0
+
+# SHD speaker-disjoint download + binning (experiment 07)
+requests>=2.28
+tqdm>=4.64
+scipy>=1.9
+
+# Physics-motivated spiking neuron library (MS-IF family / NeuronRegistry).
+# Provides the Doppler, Chirp, Dual-tau, STFT, Phase, Beam and CrossInhib units.
+# Zenodo: doi:10.5281/zenodo.20110833
+dikmen-spiking-neurons @ git+https://github.com/DrCanD/dikmen-spiking-neurons.git

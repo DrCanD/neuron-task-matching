@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Data and checkpoints (not redistributed here; see README)
+data/
+*.pt
+*.h5
+*.hdf5
+*.npy
+
+# Optuna / run artefacts
+*.db
+runs/
+optuna_*/
+
+# Outputs that are regenerated
+*.png
+!figures/*.png
+.DS_Store
