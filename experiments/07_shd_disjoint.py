@@ -1,18 +1,16 @@
-# ============================================================================
-# A cross-domain double dissociation of neuron-task matching in pure
-# spiking networks  --  Dikmen & Karadag
-#
-# Verified, locked experiment script. The body below is the exact code that
-# produced the paper numbers; it is kept self-contained for Colab paste-and-run.
-# Requires the dikmen-spiking-neurons library (NeuronRegistry). See README.
-#
-# SHD official speaker-disjoint re-run (primary audio result)
-# Paper: Section 3.3 split definition, Table 3 (disjoint ranking, Doppler 6th) and
-# Figure 4 (Spearman rho = 0.76 between mixed and disjoint orderings). Self-downloads
-# SHD from zenkelab.org and bins to 12 frames; no Drive cache required.
-# Source cell: "Shd deep probe" notebook, cell 6.
-# ============================================================================
 
+
+# ==========================================================================
+# A cross-domain double dissociation of neuron-task matching in pure spiking networks
+# Dikmen & Karadag.  Faithful experiment script; shared harness imported from mstask.core.
+# ==========================================================================
+# SHD official speaker-disjoint re-run (primary audio result).
+# Paper: Section 3.3 split, Table 3 ranking and Figure 4 (Spearman 0.76).
+
+import mstask  # ensures dikmen-spiking-neurons is importable
+from mstask.core import (
+    FeatureStack, VerticalNet, _calibrate_stack, _make_norm, _strat_split, accuracy, calibrate_thresholds, firing_snapshot, load_registry, macro_f1, register_dataset, spearman,
+)
 # ═══════════════════════════════════════════════════════════════════════════
 # SHD SPEAKER-DISJOINT  ·  per-neuron ranking re-run  (reviewer fix #2)
 # ───────────────────────────────────────────────────────────────────────────
@@ -117,9 +115,9 @@ if os.environ.get("REDUCED") == "1":
 if IN_COLAB:
     from google.colab import drive
     drive.mount("/content/drive", force_remount=False)
-    RESEARCH = Path("/content/drive/MyDrive/Research")
+    RESEARCH = Path(os.environ.get('RESEARCH_ROOT','./data'))
 else:
-    RESEARCH = Path("/home/claude/research")
+    RESEARCH = Path(os.environ.get('RESEARCH_ROOT', './data'))
 RESEARCH.mkdir(parents=True, exist_ok=True)
 PROJECT = RESEARCH / "NISAC_DeepHetero"
 PROJECT.mkdir(parents=True, exist_ok=True)
@@ -130,21 +128,7 @@ CACHE.mkdir(parents=True, exist_ok=True)
 # ═══════════════════════════════════════════════════════════════════════════
 # dikmen-spiking-neurons import (mandatory sys.modules cleanup + GitHub fallback)
 # ═══════════════════════════════════════════════════════════════════════════
-def _clear_dikmen():
-    for k in [k for k in sys.modules if k.startswith("dikmen")]:
-        del sys.modules[k]
 
-_clear_dikmen()
-try:
-    import dikmen_neurons  # noqa
-except ImportError:
-    url = "git+https://github.com/DrCanD/dikmen-spiking-neurons.git"
-    print("[SETUP] installing dikmen-spiking-neurons from GitHub ...")
-    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", url])
-    if r.returncode != 0:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                        "--break-system-packages", url], check=True)
-    _clear_dikmen()
 
 import numpy as np
 import torch
@@ -181,18 +165,7 @@ NeuronRegistry._all["Vanilla-LIF"] = VanillaLIF
 # ═══════════════════════════════════════════════════════════════════════════
 REGISTRY_PATH = RESEARCH / "datasets.json"
 
-def load_registry():
-    if REGISTRY_PATH.exists():
-        with open(REGISTRY_PATH) as f:
-            return json.load(f)
-    return {}
 
-def register_dataset(name, path, **meta):
-    reg = load_registry()
-    reg[name] = {"path": str(path), "registered": datetime.now().isoformat(), **meta}
-    with open(REGISTRY_PATH, "w") as f:
-        json.dump(reg, f, indent=2)
-    print(f"[REGISTRY] {name} -> {path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -267,17 +240,6 @@ def _bin_h5(h5_path, T, F, duration):
             np.add.at(X, (np.full(b.shape, i), b, u), 1.0)
     return X, labels
 
-def _strat_split(X, y, frac, seed):
-    try:
-        from sklearn.model_selection import train_test_split
-        A, B, ya, yb = train_test_split(X, y, test_size=frac, stratify=y, random_state=seed)
-        return A, ya, B, yb
-    except Exception:
-        rng = np.random.default_rng(seed); ia, ib = [], []
-        for c in np.unique(y):
-            ci = np.where(y == c)[0]; rng.shuffle(ci); k = int((1 - frac) * len(ci))
-            ia += list(ci[:k]); ib += list(ci[k:])
-        return X[ia], y[ia], X[ib], y[ib]
 
 def load_shd_disjoint():
     """Returns train/val/test tensors. test = OFFICIAL disjoint test; val carved from train."""
@@ -326,85 +288,17 @@ def _make_synth_h5(split):
 # ═══════════════════════════════════════════════════════════════════════════
 # Deep bodies (inline) — verbatim from the ablation/dissociation harness (norm="none")
 # ═══════════════════════════════════════════════════════════════════════════
-def _make_norm(kind, width):
-    if kind == "layer": return nn.LayerNorm(width)
-    if kind == "batch": return nn.BatchNorm1d(width)
-    return nn.Identity()                       # PURE SNN default
 
-class FeatureStack(nn.Module):
-    def __init__(self, in_features, layer_types, width, neuron_kwargs=None, norm="none"):
-        super().__init__()
-        neuron_kwargs = neuron_kwargs or {}
-        dims = [in_features] + [width] * len(layer_types)
-        self.projs = nn.ModuleList([nn.Linear(dims[i], dims[i+1]) for i in range(len(layer_types))])
-        self.norms = nn.ModuleList([_make_norm(norm, width) for _ in layer_types])
-        self.neurons = nn.ModuleList(
-            [NeuronRegistry.create(t, size=width, **neuron_kwargs.get(t, {})) for t in layer_types])
-        self.width = width
-    def forward(self, x):
-        h = x
-        for proj, norm, neuron in zip(self.projs, self.norms, self.neurons):
-            B, T, d = h.shape
-            z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-            spk, _ = neuron(z); h = spk
-        return h.mean(dim=1), h
-    def layer_firing(self, x):
-        h, rates = x, []
-        for proj, norm, neuron in zip(self.projs, self.norms, self.neurons):
-            B, T, d = h.shape
-            z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-            spk, _ = neuron(z); rates.append(spk.float().mean().item()); h = spk
-        return rates
 
-class VerticalNet(nn.Module):
-    def __init__(self, in_features, n_classes, layer_types, width, neuron_kwargs=None, norm="none"):
-        super().__init__()
-        self.stack = FeatureStack(in_features, layer_types, width, neuron_kwargs, norm)
-        self.readout = nn.Linear(width, n_classes)
-        self.layer_types = list(layer_types)
-    def forward(self, x):
-        feat, _ = self.stack(x); return self.readout(feat)
-    def firing_rates(self, x):
-        return self.stack.layer_firing(x)
 
-def count_params(m): return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
-@torch.no_grad()
-def _calibrate_stack(stack, h, target, iters=30):
-    """Bisection: set each layer's threshold so init firing ~= target. The spike
-    equation (mem >= threshold) is unchanged; threshold is a per-layer scalar."""
-    for proj, norm, neuron in zip(stack.projs, stack.norms, stack.neurons):
-        B, T, d = h.shape
-        z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-        a, b = 1e-3, 1e5
-        for _ in range(iters):
-            mid = (a*b)**0.5; neuron.threshold = mid
-            r = neuron(z)[0].float().mean().item()
-            if r > target: a = mid
-            else:          b = mid
-        neuron.threshold = (a*b)**0.5
-        h = neuron(z)[0]
-    return stack
 
-@torch.no_grad()
-def calibrate_thresholds(model, x, target):
-    _calibrate_stack(model.stack, x, target)
-    return model
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Metrics / eval / bootstrap  (verbatim from the ablation)
 # ═══════════════════════════════════════════════════════════════════════════
-def accuracy(p, t, C=None): return float((p == t).mean())
 
-def macro_f1(p, t, C):
-    f1s = []
-    for c in range(C):
-        tp = int(np.sum((p == c) & (t == c))); fp = int(np.sum((p == c) & (t != c)))
-        fn = int(np.sum((p != c) & (t == c)))
-        pr = tp/(tp+fp) if (tp+fp) else 0.0; rc = tp/(tp+fn) if (tp+fn) else 0.0
-        f1s.append(2*pr*rc/(pr+rc) if (pr+rc) else 0.0)
-    return float(np.mean(f1s)), [round(float(x), 4) for x in f1s]
 
 METRICS = {"accuracy": lambda p, t, C: accuracy(p, t),
            "macro_f1": lambda p, t, C: macro_f1(p, t, C)[0]}
@@ -416,8 +310,6 @@ def evaluate(model, loader):
         preds.append(model(xb.to(device)).argmax(1).cpu()); trues.append(yb)
     return torch.cat(preds).numpy(), torch.cat(trues).numpy()
 
-def firing_snapshot(model, xb):
-    return model.firing_rates(xb)
 
 def paired_bootstrap(preds_a, preds_b, trues, metric_fn, C, nboot=2000, seed=0):
     """Paired bootstrap over test examples; resamples preds AND trues by the same indices."""
@@ -504,12 +396,6 @@ def train_one(method, seed, Fin, C, NK, tr_loader, va_loader, te_loader, fire_ba
 # ═══════════════════════════════════════════════════════════════════════════
 # Rank correlation (Spearman, manual: Pearson on ranks; no scipy dependency)
 # ═══════════════════════════════════════════════════════════════════════════
-def spearman(names, score_x, score_y):
-    xs = np.array([score_x[n] for n in names], dtype=float)
-    ys = np.array([score_y[n] for n in names], dtype=float)
-    rx = xs.argsort().argsort().astype(float)
-    ry = ys.argsort().argsort().astype(float)
-    return float(np.corrcoef(rx, ry)[0, 1])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -636,4 +522,6 @@ def main():
     print(f"\n[DONE] summary -> {RUN_DIR / 'summary.json'}")
     return summary
 
-summary = main()
+
+if __name__ == "__main__":
+    summary = main()

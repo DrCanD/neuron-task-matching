@@ -1,17 +1,16 @@
-# ============================================================================
-# A cross-domain double dissociation of neuron-task matching in pure
-# spiking networks  --  Dikmen & Karadag
-#
-# Verified, locked experiment script. The body below is the exact code that
-# produced the paper numbers; it is kept self-contained for Colab paste-and-run.
-# Requires the dikmen-spiking-neurons library (NeuronRegistry). See README.
-#
-# Cross-domain dissociation — SHD audio per-neuron homogeneous bake-off
-# Paper: Section 4.3 (mixed-split half of Figure 4). Tests whether the neuron ranking
-# changes across domains. Pre-registered prediction: Doppler-LIF is NOT top on audio.
-# Source cell: "Shd deep probe" notebook, cell 4.
-# ============================================================================
 
+
+# ==========================================================================
+# A cross-domain double dissociation of neuron-task matching in pure spiking networks
+# Dikmen & Karadag.  Faithful experiment script; shared harness imported from mstask.core.
+# ==========================================================================
+# Cross-domain dissociation — SHD audio per-neuron bake-off (speaker-mixed split).
+# Paper: Section 4.3, mixed-split half of Figure 4.
+
+import mstask  # ensures dikmen-spiking-neurons is importable
+from mstask.core import (
+    FeatureStack, VerticalNet, _make_norm, accuracy, calibrate_thresholds, count_params, macro_f1,
+)
 # ══════════════════════════════════════════════════════════════════════════════
 # CROSS-DOMAIN DISSOCIATION  ·  SHD (audio) per-neuron homogeneous bake-off
 # Counterpart to the DIAT-µSAT ablation. Tests whether the neuron RANKING changes
@@ -61,10 +60,7 @@ class CFG:
     SEEDS        = [42, 123, 999]
     USE_TQDM     = True
     HEARTBEAT_EVERY = 5
-    if IN_COLAB:
-        PROJECT = "/content/drive/MyDrive/Research/NISAC_DeepHetero"
-    else:
-        PROJECT = "/home/claude/shd_run"
+    PROJECT = os.environ.get("RESEARCH_ROOT", "./data") + "/NISAC_DeepHetero"
 
 cfg = CFG()
 
@@ -78,7 +74,7 @@ DIAT_HOMOG = {"Doppler-LIF": 0.8719, "Dual-tau-LIF": 0.8598,
               "Chirp-LIF": 0.6971, "STFT-IF": 0.1850}
 
 if IN_COLAB:
-    os.system("pip install -q git+https://github.com/DrCanD/dikmen-spiking-neurons.git tqdm")
+    os.system("pip install -q tqdm")  # dikmen handled by `import mstask`
     from google.colab import drive
     drive.mount("/content/drive", force_remount=False)
 
@@ -113,7 +109,7 @@ NeuronRegistry._all["Vanilla-LIF"] = VanillaLIF
 # SHD loader  (verified; .pt dict [N,T=12,F=700], 20 classes, speaker-mixed cache)
 # ══════════════════════════════════════════════════════════════════════════════
 REGISTRY_PATH = Path(cfg.PROJECT) / "datasets.json"
-SHD_PATH = "/content/drive/MyDrive/Research/GHN_Instinct/gesture_cache/shd_T12_m200_v2.pt"
+SHD_PATH = os.environ.get("SHD_CACHE", "/content/drive/MyDrive/Research/GHN_Instinct/gesture_cache/shd_T12_m200_v2.pt")
 
 def load_shd():
     if not IN_COLAB:                      # sandbox: synthetic SHD-shaped data
@@ -163,70 +159,11 @@ print(f"[DATA] SHD train={tuple(Xtr.shape)} val={tuple(Xva.shape)} test={tuple(X
 # ══════════════════════════════════════════════════════════════════════════════
 # Harness (inline) — identical to the verified DIAT cells
 # ══════════════════════════════════════════════════════════════════════════════
-def _make_norm(kind, width):
-    if kind == "layer": return nn.LayerNorm(width)
-    if kind == "batch": return nn.BatchNorm1d(width)
-    return nn.Identity()
 
-class FeatureStack(nn.Module):
-    def __init__(self, in_features, layer_types, width, neuron_kwargs=None, norm="none"):
-        super().__init__()
-        neuron_kwargs = neuron_kwargs or {}
-        dims = [in_features] + [width]*len(layer_types)
-        self.projs = nn.ModuleList([nn.Linear(dims[i], dims[i+1]) for i in range(len(layer_types))])
-        self.norms = nn.ModuleList([_make_norm(norm, width) for _ in layer_types])
-        self.neurons = nn.ModuleList(
-            [NeuronRegistry.create(t, size=width, **neuron_kwargs.get(t, {})) for t in layer_types])
-    def forward(self, x):
-        h = x
-        for proj, norm, neuron in zip(self.projs, self.norms, self.neurons):
-            B, T, d = h.shape
-            z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-            spk, _ = neuron(z); h = spk
-        return h.mean(dim=1), h
-    def layer_firing(self, x):
-        h, rates = x, []
-        for proj, norm, neuron in zip(self.projs, self.norms, self.neurons):
-            B, T, d = h.shape
-            z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-            spk, _ = neuron(z); rates.append(spk.float().mean().item()); h = spk
-        return rates
 
-class VerticalNet(nn.Module):
-    def __init__(self, in_features, n_classes, layer_types, width, neuron_kwargs=None, norm="none"):
-        super().__init__()
-        self.stack = FeatureStack(in_features, layer_types, width, neuron_kwargs, norm)
-        self.readout = nn.Linear(width, n_classes)
-    def forward(self, x):
-        feat, _ = self.stack(x); return self.readout(feat)
-    def firing_rates(self, x): return self.stack.layer_firing(x)
 
-def count_params(m): return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
-@torch.no_grad()
-def calibrate_thresholds(model, x, target, iters=30):
-    h = x
-    for proj, norm, neuron in zip(model.stack.projs, model.stack.norms, model.stack.neurons):
-        B, T, d = h.shape
-        z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-        a, b = 1e-3, 1e5
-        for _ in range(iters):
-            mid = (a*b)**0.5; neuron.threshold = mid
-            r = neuron(z)[0].float().mean().item()
-            if r > target: a = mid
-            else:          b = mid
-        neuron.threshold = (a*b)**0.5
-        h = neuron(z)[0]
-    return model
 
-def accuracy(p, t): return float((p == t).mean())
-def macro_f1(p, t, C):
-    f1s = []
-    for c in range(C):
-        tp = int(np.sum((p==c)&(t==c))); fp = int(np.sum((p==c)&(t!=c))); fn = int(np.sum((p!=c)&(t==c)))
-        pr = tp/(tp+fp) if (tp+fp) else 0.0; rc = tp/(tp+fn) if (tp+fn) else 0.0
-        f1s.append(2*pr*rc/(pr+rc) if (pr+rc) else 0.0)
-    return float(np.mean(f1s))
 METRICS = {"macro_f1": lambda p,t,C: macro_f1(p,t,C), "accuracy": lambda p,t,C: accuracy(p,t)}
 
 @torch.no_grad()

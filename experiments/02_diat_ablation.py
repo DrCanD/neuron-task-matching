@@ -1,18 +1,3 @@
-# ============================================================================
-# A cross-domain double dissociation of neuron-task matching in pure
-# spiking networks  --  Dikmen & Karadag
-#
-# Verified, locked experiment script. The body below is the exact code that
-# produced the paper numbers; it is kept self-contained for Colab paste-and-run.
-# Requires the dikmen-spiking-neurons library (NeuronRegistry). See README.
-#
-# Experiment 2/3 — HEADLINE: matched-capacity ablation on DIAT-uSAT
-# Paper: Section 4.1 "Heterogeneity does not win" and Figure 3.
-# Families at matched capacity: homogeneous (D0_*), vertical heterogeneous (D1_*),
-# horizontal path bank (D2_concat). Doppler-LIF homogeneous is the matched baseline.
-# Source cell: "Shd deep probe" notebook, cell 1.
-# ============================================================================
-
 """
 DIAT-uSAT DEEP ABLATION — pure-SNN MS-IF heterogeneity (vertical vs horizontal)
 Experiment 2/3: HEADLINE. Micro-Doppler radar (spectrogram-as-sequence, T=64).
@@ -25,6 +10,18 @@ paired bootstrap vs the best homogeneous baseline, pre-registered before results
 
 Paste into one Colab cell and Run. Resumes from checkpoint if interrupted.
 """
+
+# ==========================================================================
+# A cross-domain double dissociation of neuron-task matching in pure spiking networks
+# Dikmen & Karadag.  Faithful experiment script; shared harness imported from mstask.core.
+# ==========================================================================
+# HEADLINE — matched-capacity ablation on DIAT-uSAT.  Paper: Section 4.1, Figure 3.
+# Homogeneous (D0) vs vertical (D1) vs horizontal bank (D2) at equal parameter count.
+
+import mstask  # ensures dikmen-spiking-neurons is importable
+from mstask.core import (
+    FeatureStack, PathBankNet, VerticalNet, _calibrate_stack, _make_norm, _solve_width, accuracy, calibrate_thresholds, count_params, firing_snapshot, get_dataset_path, load_registry, macro_f1, register_dataset,
+)
 
 # ════════════════════════════════════════════════════════════════
 # Imports + environment
@@ -48,7 +45,7 @@ try:
 except Exception:
     ON_COLAB = False
 
-RESEARCH = Path('/content/drive/MyDrive/Research') if ON_COLAB else Path('.')
+RESEARCH = Path(os.environ.get('RESEARCH_ROOT', './data'))
 RESEARCH.mkdir(parents=True, exist_ok=True)
 PROJECT = RESEARCH / 'NISAC_DeepHetero'
 PROJECT.mkdir(parents=True, exist_ok=True)
@@ -119,22 +116,7 @@ D2_PATHS = ["Doppler-LIF", "Chirp-LIF", "STFT-IF", "Dual-tau-LIF", "CrossInhib-L
 # ════════════════════════════════════════════════════════════════
 # dikmen-spiking-neurons  (pip-install from GitHub if not present)
 # ════════════════════════════════════════════════════════════════
-def _clear_dikmen():
-    for k in [k for k in sys.modules if k.startswith('dikmen')]:
-        del sys.modules[k]
 
-_clear_dikmen()
-try:
-    import dikmen_neurons  # noqa: F401  (already installed?)
-except ImportError:
-    import subprocess
-    url = "git+https://github.com/DrCanD/dikmen-spiking-neurons.git"
-    print("[SETUP] installing dikmen-spiking-neurons from GitHub ...")
-    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", url])
-    if r.returncode != 0:                      # PEP 668 externally-managed env
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                        "--break-system-packages", url], check=True)
-    _clear_dikmen()
 
 from dikmen_neurons import NeuronRegistry   # 39 models / 8 families; we use MS-IF (ISAC)
 
@@ -144,31 +126,13 @@ from dikmen_neurons import NeuronRegistry   # 39 models / 8 families; we use MS-
 # ════════════════════════════════════════════════════════════════
 REGISTRY_PATH = RESEARCH / 'datasets.json'
 
-def load_registry():
-    if REGISTRY_PATH.exists():
-        with open(REGISTRY_PATH) as f:
-            return json.load(f)
-    return {}
 
-def register_dataset(name, path, **meta):
-    reg = load_registry()
-    reg[name] = {'path': str(path), 'registered': datetime.now().isoformat(), **meta}
-    with open(REGISTRY_PATH, 'w') as f:
-        json.dump(reg, f, indent=2)
 
-def get_dataset_path(name):
-    reg = load_registry()
-    if name not in reg:
-        raise KeyError(f"Dataset '{name}' not in registry {list(reg.keys())}. Register it.")
-    p = Path(reg[name]['path'])
-    if not p.exists():
-        raise FileNotFoundError(f"'{name}' registered at {p} but not found.")
-    return p
 
 # register DIAT-uSAT once if missing (folder with X.npy + y.npy)
 if 'diat' not in load_registry():
     register_dataset('diat',
-        path='/content/drive/MyDrive/NISAC/data/DIAT_uSAT/processed',
+        path=os.environ.get('DIAT_DATA', '/content/drive/MyDrive/NISAC/data/DIAT_uSAT/processed'),
         source='DIAT micro-Doppler uSAT', format='folder-npy', classes=6, T=64, features=64,
         notes='X.npy [N,64,64] + y.npy; spectrogram-as-sequence; 80/20 stratified split seed=0')
 
@@ -199,108 +163,13 @@ def load_diat():
 # ════════════════════════════════════════════════════════════════
 # Deep bodies (inline) — sandbox-verified
 # ════════════════════════════════════════════════════════════════
-def _make_norm(kind, width):
-    if kind == "layer":
-        return nn.LayerNorm(width)
-    if kind == "batch":
-        return nn.BatchNorm1d(width)
-    return nn.Identity()           # PURE SNN default
 
-class FeatureStack(nn.Module):
-    """L (Linear -> [norm] -> neuron) layers; returns (time-avg feat [B,W], last spk [B,T,W])."""
-    def __init__(self, in_features, layer_types, width, neuron_kwargs=None, norm="none"):
-        super().__init__()
-        neuron_kwargs = neuron_kwargs or {}
-        dims = [in_features] + [width] * len(layer_types)
-        self.projs = nn.ModuleList([nn.Linear(dims[i], dims[i+1]) for i in range(len(layer_types))])
-        self.norms = nn.ModuleList([_make_norm(norm, width) for _ in layer_types])
-        self.neurons = nn.ModuleList([NeuronRegistry.create(t, size=width, **neuron_kwargs.get(t, {}))
-                                      for t in layer_types])
-        self.width = width
-    def forward(self, x):
-        h = x
-        for proj, norm, neuron in zip(self.projs, self.norms, self.neurons):
-            B, T, d = h.shape
-            z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-            spk, _ = neuron(z)
-            h = spk
-        return h.mean(dim=1), h
-    def layer_firing(self, x):
-        h, rates = x, []
-        for proj, norm, neuron in zip(self.projs, self.norms, self.neurons):
-            B, T, d = h.shape
-            z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-            spk, _ = neuron(z); rates.append(spk.float().mean().item()); h = spk
-        return rates
 
-class VerticalNet(nn.Module):
-    def __init__(self, in_features, n_classes, layer_types, width, neuron_kwargs=None, norm="none"):
-        super().__init__()
-        self.stack = FeatureStack(in_features, layer_types, width, neuron_kwargs, norm)
-        self.readout = nn.Linear(width, n_classes)
-    def forward(self, x):
-        feat, _ = self.stack(x); return self.readout(feat)
-    def firing_rates(self, x):
-        return self.stack.layer_firing(x)
 
-class PathBankNet(nn.Module):
-    def __init__(self, in_features, n_classes, path_types, width, n_layers,
-                 fusion="concat", neuron_kwargs=None, norm="none", shared_stem=True):
-        super().__init__()
-        if shared_stem:
-            self.stem = nn.Linear(in_features, width); path_in = width
-        else:
-            self.stem = None; path_in = in_features
-        self.paths = nn.ModuleList([FeatureStack(path_in, [t]*n_layers, width, neuron_kwargs, norm)
-                                    for t in path_types])
-        self.readout = nn.Linear(width * len(path_types), n_classes)
-        self.n_paths = len(path_types); self.width = width
-    def forward(self, x):
-        if self.stem is not None:
-            B, T, d = x.shape; x = self.stem(x.reshape(B*T, d)).reshape(B, T, -1)
-        feats = [p(x)[0] for p in self.paths]
-        return self.readout(torch.cat(feats, dim=-1))
-    def path_firing(self, x):
-        if self.stem is not None:
-            B, T, d = x.shape; x = self.stem(x.reshape(B*T, d)).reshape(B, T, -1)
-        return [p(x)[1].float().mean().item() for p in self.paths]
 
-def count_params(m):
-    return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
-def _solve_width(builder, target, wmax=400):
-    best = None
-    for w in range(2, wmax):
-        p = count_params(builder(w)); d = abs(p - target)
-        if best is None or d < best[2]:
-            best = (w, p, d)
-    return best
 
-@torch.no_grad()
-def _calibrate_stack(stack, h, target, iters=30):
-    for proj, norm, neuron in zip(stack.projs, stack.norms, stack.neurons):
-        B, T, d = h.shape
-        z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-        a, b = 1e-3, 1e5
-        for _ in range(iters):
-            mid = (a*b) ** 0.5; neuron.threshold = mid
-            r = neuron(z)[0].float().mean().item()
-            a, b = (mid, b) if r > target else (a, mid)
-        neuron.threshold = (a*b) ** 0.5
-        h = neuron(z)[0]
-    return stack
 
-@torch.no_grad()
-def calibrate_thresholds(model, x, target):
-    if isinstance(model, VerticalNet):
-        _calibrate_stack(model.stack, x, target)
-    else:
-        h = x
-        if model.stem is not None:
-            B, T, d = x.shape; h = model.stem(x.reshape(B*T, d)).reshape(B, T, -1)
-        for p in model.paths:
-            _calibrate_stack(p, h, target)
-    return model
 
 
 # ════════════════════════════════════════════════════════════════
@@ -349,25 +218,11 @@ def evaluate(model, loader):
         preds.append(model(xb.to(device)).argmax(1).cpu()); trues.append(yb)
     return torch.cat(preds).numpy(), torch.cat(trues).numpy()
 
-def accuracy(preds, trues, C=None):
-    return float((preds == trues).mean())
 
-def macro_f1(preds, trues, C):
-    f1s = []
-    for c in range(C):
-        tp = int(np.sum((preds == c) & (trues == c)))
-        fp = int(np.sum((preds == c) & (trues != c)))
-        fn = int(np.sum((preds != c) & (trues == c)))
-        p = tp / (tp + fp) if (tp + fp) else 0.0
-        r = tp / (tp + fn) if (tp + fn) else 0.0
-        f1s.append(2 * p * r / (p + r) if (p + r) else 0.0)
-    return float(np.mean(f1s)), [round(float(x), 4) for x in f1s]
 
 METRICS = {"accuracy": lambda p, t, C: accuracy(p, t),
            "macro_f1": lambda p, t, C: macro_f1(p, t, C)[0]}
 
-def firing_snapshot(model, xb):
-    return model.firing_rates(xb) if isinstance(model, VerticalNet) else model.path_firing(xb)
 
 def train_one(method, seed, Fin, C, NK, matched, tr_loader, va_loader, te_loader, fire_batch, ckpt_dir):
     """Early stopping on SMOOTHED validation (moving avg, denoised); report TEST once at the
@@ -572,4 +427,6 @@ def main():
     print(f"\n[DONE] summary -> {RUN_DIR / 'summary.json'}")
     return summary
 
-summary = main()
+
+if __name__ == "__main__":
+    summary = main()

@@ -1,17 +1,16 @@
-# ============================================================================
-# A cross-domain double dissociation of neuron-task matching in pure
-# spiking networks  --  Dikmen & Karadag
-#
-# Verified, locked experiment script. The body below is the exact code that
-# produced the paper numbers; it is kept self-contained for Colab paste-and-run.
-# Requires the dikmen-spiking-neurons library (NeuronRegistry). See README.
-#
-# Best-model search (application phase) — multi-objective Optuna HPO
-# Paper: Section 4.2 / Table 2. Maximises val macro-F1 and minimises mean firing.
-# Candidates: Doppler homogeneous, D2 path-bank, Vanilla-LIF baseline.
-# Source cell: "Shd deep probe" notebook, cell 2.
-# ============================================================================
 
+
+# ==========================================================================
+# A cross-domain double dissociation of neuron-task matching in pure spiking networks
+# Dikmen & Karadag.  Faithful experiment script; shared harness imported from mstask.core.
+# ==========================================================================
+# Best-model search (application phase).  Paper: Section 4.2, Table 2.
+# Multi-objective Optuna over Doppler homogeneous, the D2 path-bank and Vanilla-LIF.
+
+import mstask  # ensures dikmen-spiking-neurons is importable
+from mstask.core import (
+    FeatureStack, VerticalNet, _calibrate_stack, _make_norm, _strat_split, accuracy, calibrate_thresholds, count_params, macro_f1,
+)
 # ══════════════════════════════════════════════════════════════════════════════
 # DIAT-uSAT  ·  BEST-MODEL SEARCH  (application phase, separate from the ablation)
 # Multi-objective HPO:  maximize test macro-F1   ·   minimize test mean-firing
@@ -84,8 +83,8 @@ class HPO:
         PROJECT  = "/content/drive/MyDrive/Research/NISAC_DeepHetero"
         DATA_DIR = "/content/drive/MyDrive/NISAC/data/DIAT_uSAT/processed"
     else:
-        PROJECT  = "/home/claude/hpo_run"
-        DATA_DIR = "/home/claude/syn_diat"
+        PROJECT  = os.environ.get("RESEARCH_ROOT", "./data") + "/NISAC_DeepHetero"
+        DATA_DIR = os.environ.get("DIAT_DATA", "./data/DIAT_uSAT/processed")
 
 cfg = HPO()
 
@@ -113,7 +112,7 @@ if os.environ.get("REDUCED") == "1":
 
 # ── Colab-only setup ──────────────────────────────────────────────────────────
 if IN_COLAB:
-    os.system("pip install -q git+https://github.com/DrCanD/dikmen-spiking-neurons.git optuna")
+    os.system("pip install -q optuna")  # dikmen handled by `import mstask`
     from google.colab import drive
     drive.mount("/content/drive", force_remount=False)
 
@@ -182,44 +181,8 @@ D2_PATHS = ["Doppler-LIF", "Chirp-LIF", "STFT-IF", "Dual-tau-LIF", "CrossInhib-L
 # ══════════════════════════════════════════════════════════════════════════════
 # Deep bodies (inline) — identical to the ablation harness
 # ══════════════════════════════════════════════════════════════════════════════
-def _make_norm(kind, width):
-    if kind == "layer": return nn.LayerNorm(width)
-    if kind == "batch": return nn.BatchNorm1d(width)
-    return nn.Identity()                      # PURE SNN default
 
-class FeatureStack(nn.Module):
-    def __init__(self, in_features, layer_types, width, neuron_kwargs=None, norm="none"):
-        super().__init__()
-        neuron_kwargs = neuron_kwargs or {}
-        dims = [in_features] + [width] * len(layer_types)
-        self.projs = nn.ModuleList([nn.Linear(dims[i], dims[i+1]) for i in range(len(layer_types))])
-        self.norms = nn.ModuleList([_make_norm(norm, width) for _ in layer_types])
-        self.neurons = nn.ModuleList(
-            [NeuronRegistry.create(t, size=width, **neuron_kwargs.get(t, {})) for t in layer_types])
-        self.width = width
-    def forward(self, x):
-        h = x
-        for proj, norm, neuron in zip(self.projs, self.norms, self.neurons):
-            B, T, d = h.shape
-            z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-            spk, _ = neuron(z); h = spk
-        return h.mean(dim=1), h
-    def layer_firing(self, x):
-        h, rates = x, []
-        for proj, norm, neuron in zip(self.projs, self.norms, self.neurons):
-            B, T, d = h.shape
-            z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-            spk, _ = neuron(z); rates.append(spk.float().mean().item()); h = spk
-        return rates
 
-class VerticalNet(nn.Module):
-    def __init__(self, in_features, n_classes, layer_types, width, neuron_kwargs=None, norm="none"):
-        super().__init__()
-        self.stack = FeatureStack(in_features, layer_types, width, neuron_kwargs, norm)
-        self.readout = nn.Linear(width, n_classes)
-    def forward(self, x):
-        feat, _ = self.stack(x); return self.readout(feat)
-    def firing_rates(self, x): return self.stack.layer_firing(x)
 
 class PathBankNet(nn.Module):
     def __init__(self, in_features, n_classes, path_types, width, n_layers,
@@ -244,48 +207,12 @@ class PathBankNet(nn.Module):
             B, T, d = x.shape; x = self.stem(x.reshape(B*T, d)).reshape(B, T, -1)
         return [p(x)[1].float().mean().item() for p in self.paths]
 
-def count_params(m): return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
-@torch.no_grad()
-def _calibrate_stack(stack, h, target, iters=30):
-    for proj, norm, neuron in zip(stack.projs, stack.norms, stack.neurons):
-        B, T, d = h.shape
-        z = norm(proj(h.reshape(B*T, d))).reshape(B, T, -1)
-        a, b = 1e-3, 1e5
-        for _ in range(iters):
-            mid = (a*b)**0.5; neuron.threshold = mid
-            r = neuron(z)[0].float().mean().item()
-            if r > target: a = mid
-            else:          b = mid
-        neuron.threshold = (a*b)**0.5
-        h = neuron(z)[0]
-    return stack
 
-@torch.no_grad()
-def calibrate_thresholds(model, x, target):
-    if isinstance(model, VerticalNet):
-        _calibrate_stack(model.stack, x, target)
-    else:
-        h = x
-        if model.stem is not None:
-            B, T, d = x.shape; h = model.stem(x.reshape(B*T, d)).reshape(B, T, -1)
-        for p in model.paths: _calibrate_stack(p, h, target)
-    return model
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Data  (precompute plain + log1p standardized splits once; train-stat standardize)
 # ══════════════════════════════════════════════════════════════════════════════
-def _strat_split(Xa, ya, frac, seed):
-    try:
-        from sklearn.model_selection import train_test_split
-        A, B, ya2, yb2 = train_test_split(Xa, ya, test_size=frac, stratify=ya, random_state=seed)
-        return A, ya2, B, yb2
-    except Exception:
-        rng = np.random.default_rng(seed); ia, ib = [], []
-        for c in np.unique(ya):
-            ci = np.where(ya == c)[0]; rng.shuffle(ci); k = int((1-frac)*len(ci))
-            ia += list(ci[:k]); ib += list(ci[k:])
-        return Xa[ia], ya[ia], Xa[ib], ya[ib]
 
 def load_data():
     base = Path(cfg.DATA_DIR)
@@ -316,15 +243,6 @@ print(f"[DATA] train={n_tr} val={n_va} test={n_te}  C={C}  F={Fin}  chance={1/C:
 # ══════════════════════════════════════════════════════════════════════════════
 # Metrics / eval / bootstrap  (verbatim from the ablation)
 # ══════════════════════════════════════════════════════════════════════════════
-def accuracy(p, t, C=None): return float((p == t).mean())
-def macro_f1(p, t, C):
-    f1s = []
-    for c in range(C):
-        tp = int(np.sum((p == c) & (t == c))); fp = int(np.sum((p == c) & (t != c)))
-        fn = int(np.sum((p != c) & (t == c)))
-        pr = tp/(tp+fp) if (tp+fp) else 0.0; rc = tp/(tp+fn) if (tp+fn) else 0.0
-        f1s.append(2*pr*rc/(pr+rc) if (pr+rc) else 0.0)
-    return float(np.mean(f1s)), [round(float(x), 4) for x in f1s]
 METRICS = {"accuracy": lambda p, t, C: accuracy(p, t),
            "macro_f1": lambda p, t, C: macro_f1(p, t, C)[0]}
 
