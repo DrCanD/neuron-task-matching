@@ -2,11 +2,13 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
 .ipynb_checkpoints/
 .venv/
 venv/
 
-# Data and checkpoints (not redistributed here; see README)
+# Data and checkpoints (not redistributed; see README)
 data/
 *.pt
 *.h5
@@ -18,7 +20,8 @@ data/
 runs/
 optuna_*/
 
-# Outputs that are regenerated
+# Regenerated rasters (keep curated figures under figures/)
 *.png
 !figures/*.png
+!figures/*.pdf
 .DS_Store

@@ -1,7 +1,9 @@
 cff-version: 1.2.0
-message: "If you use this code, please cite the paper and the spiking-neuron library below."
+message: "If you use this code, please cite the paper, this repository, and the spiking-neuron library below."
 title: "A cross-domain double dissociation of neuron-task matching in pure spiking networks (experiment code)"
+version: "1.1.0"
 type: software
+doi: "10.5281/zenodo.20763581"
 authors:
   - family-names: Dikmen
     given-names: İsmail Can
