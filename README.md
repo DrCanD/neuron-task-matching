@@ -1,9 +1,9 @@
 
 
-# ==========================================================================
+# ==================================
 # A cross-domain double dissociation of neuron-task matching in pure spiking networks
 # Dikmen & Karadag.  Faithful experiment script; shared harness imported from mstask.core.
-# ==========================================================================
+# ==================================
 # Best-model search + compact-CNN reference + operation-count proxy.
 # Paper: Section 4.2, Table 2.  No energy claim is made; the count is a proxy only.
 
