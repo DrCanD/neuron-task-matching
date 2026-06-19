@@ -1,0 +1,2 @@
+*.ipynb linguist-documentation
+* text=auto eol=lf

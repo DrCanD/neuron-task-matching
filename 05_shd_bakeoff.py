@@ -4,8 +4,8 @@
 # A cross-domain double dissociation of neuron-task matching in pure spiking networks
 # Dikmen & Karadag.  Faithful experiment script; shared harness imported from mstask.core.
 # ==========================================================================
-# Best-model search + compact-CNN reference + operation-count proxy.
-# Paper: Section 4.2, Table 2.  No energy claim is made; the count is a proxy only.
+# Best-model search (application phase).  Paper: Section 4.2, Table 2.
+# Multi-objective Optuna over Doppler homogeneous, the D2 path-bank and Vanilla-LIF.
 
 import mstask  # ensures dikmen-spiking-neurons is importable
 from mstask.core import (
@@ -95,9 +95,8 @@ cfg = HPO()
 # Doppler is done (55/55 -> resumes at 0-todo). The crux left is LIF (the baseline),
 # which is fast (homogeneous, Doppler-speed). TPE locked the good region by ~trial
 # 17, so 30 trials is plenty. Set RUN_ID unchanged so everything resumes in place.
-cfg.ARCHS    = ["doppler", "lif", "plif"]
+cfg.ARCHS    = ["doppler", "lif"]
 cfg.N_TRIALS = 30
-cfg.REEVAL_SEEDS = [42, 123, 999, 7, 2024]   # 5-seed headline; doppler/lif resume (3 cached + 2 new)
 
 # ── reduced sandbox overrides (set REDUCED=1 in env for a fast end-to-end check) ─
 if os.environ.get("REDUCED") == "1":
@@ -109,7 +108,7 @@ if os.environ.get("REDUCED") == "1":
     cfg.N_TRIALS    = 3
     cfg.REEVAL_SEEDS = [42]
     cfg.PRUNE_EPOCH = 99          # don't prune in the tiny check
-    cfg.ARCHS       = ["doppler", "lif", "plif", "d2"]
+    cfg.ARCHS       = ["doppler", "d2", "lif"]
 
 # ── Colab-only setup ──────────────────────────────────────────────────────────
 if IN_COLAB:
@@ -176,24 +175,6 @@ class VanillaLIF(BaseNeuron):
         mem = mem * (1.0 - spk)
         return spk, {"mem": mem}
 NeuronRegistry._all["Vanilla-LIF"] = VanillaLIF
-
-# Parametric-LIF baseline (Fang et al. PLIF): learnable per-neuron decay (tau), same
-# dynamics as vanilla LIF otherwise. Isolates "generic learnable adaptivity" (W params)
-# from Doppler's specific resonance/freq-selectivity (3W params). Ladder: 0 -> W -> 3W.
-class ParametricLIF(BaseNeuron):
-    _family = "plif"
-    _description = "Parametric LIF: learnable per-neuron membrane decay (no resonance)."
-    def __init__(self, size, beta=0.95, threshold=1.0):
-        super().__init__(size, beta=beta, threshold=threshold)
-        b = min(max(float(beta), 1e-3), 1 - 1e-3)
-        self.beta_logit = nn.Parameter(torch.full((size,), math.log(b / (1 - b))))
-    def single_step(self, x_t, state):
-        beta = torch.sigmoid(self.beta_logit)
-        mem = beta * state["mem"] + x_t
-        spk = spike_hard(mem, self.threshold)
-        mem = mem * (1.0 - spk)
-        return spk, {"mem": mem}
-NeuronRegistry._all["Parametric-LIF"] = ParametricLIF
 
 D2_PATHS = ["Doppler-LIF", "Chirp-LIF", "STFT-IF", "Dual-tau-LIF", "CrossInhib-LIF"]
 
@@ -294,9 +275,6 @@ def build_model(arch, W, L, beta):
     if arch == "lif":
         nk = {"Vanilla-LIF": {"beta": beta}}
         return VerticalNet(Fin, C, ["Vanilla-LIF"]*L, W, nk, "none")
-    if arch == "plif":
-        nk = {"Parametric-LIF": {"beta": beta}}
-        return VerticalNet(Fin, C, ["Parametric-LIF"]*L, W, nk, "none")
     if arch == "d2":
         nk = {t: {"beta": beta} for t in D2_PATHS}
         return PathBankNet(Fin, C, D2_PATHS, W, L, "concat", nk, "none", True)
@@ -500,7 +478,7 @@ for arch in cfg.ARCHS:
 
 print("\n[BOOTSTRAP] paired on test, per re-eval seed (consistent = same sign all seeds)")
 boot = {}
-pairs = [("doppler", "lif"), ("doppler", "plif"), ("plif", "lif"), ("d2", "lif"), ("doppler", "d2")]
+pairs = [("doppler", "lif"), ("d2", "lif"), ("doppler", "d2")]
 for a, b in pairs:
     if a not in cfg.ARCHS or b not in cfg.ARCHS: continue
     for label, mfn in [("F1", METRICS["macro_f1"]), ("acc", METRICS["accuracy"])]:
@@ -518,125 +496,6 @@ for a, b in pairs:
         boot[f"{a}-{b}[{label}]"] = {"mean": mean, "cis": cis, "consistent": consistent}
         print(f"   {a} - {b} [{label}]: mean {mean:+.4f}  CIs {cis}  consistent={consistent}")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CNN baseline on the SAME split  (reference point vs the spiking models)
-# ══════════════════════════════════════════════════════════════════════════════
-class SmallCNN(nn.Module):
-    def __init__(self, n_classes, ch=(16, 32, 64)):
-        super().__init__()
-        layers, c0 = [], 1
-        for c in ch:
-            layers += [nn.Conv2d(c0, c, 3, padding=1), nn.BatchNorm2d(c), nn.ReLU(), nn.MaxPool2d(2)]
-            c0 = c
-        self.features = nn.Sequential(*layers)
-        self.head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(ch[-1], n_classes))
-    def forward(self, x):                       # x: [N, 64, 64] -> 1-channel image
-        return self.head(self.features(x.unsqueeze(1)))
-
-def count_macs_cnn(model):
-    macs = [0]
-    def ch(m, i, o):
-        oh, ow = o.shape[-2], o.shape[-1]; kh, kw = m.kernel_size
-        macs[0] += oh*ow*m.out_channels*m.in_channels*kh*kw
-    def lh(m, i, o):
-        macs[0] += m.in_features*m.out_features
-    hs = []
-    for mod in model.modules():
-        if isinstance(mod, nn.Conv2d): hs.append(mod.register_forward_hook(ch))
-        elif isinstance(mod, nn.Linear): hs.append(mod.register_forward_hook(lh))
-    model.eval()
-    with torch.no_grad(): model(torch.zeros(1, Fin, Fin, device=device))
-    for h in hs: h.remove()
-    return macs[0]
-
-def cnn_train_eval(seed):
-    torch.manual_seed(seed); np.random.seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-    Xtr, ytr, Xva, yva, Xte, yte = DATA["plain"]
-    model = SmallCNN(C).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.MAX_EPOCHS)
-    best_val, best, pc, val_hist = -1.0, None, 0, []
-    use_bar = cfg.USE_TQDM and _HAS_TQDM
-    it = tqdm(range(cfg.MAX_EPOCHS), desc=f"cnn_s{seed}", leave=False) if use_bar else range(cfg.MAX_EPOCHS)
-    for ep in it:
-        model.train(); perm = torch.randperm(len(Xtr))
-        for i in range(0, len(Xtr), cfg.BATCH):
-            b = perm[i:i+cfg.BATCH]; opt.zero_grad(set_to_none=True)
-            F.cross_entropy(model(Xtr[b].to(device)), ytr[b].to(device)).backward(); opt.step()
-        sched.step()
-        vp, vt = evaluate(model, Xva, yva, cfg.BATCH); v = macro_f1(vp, vt, C)[0]; val_hist.append(v)
-        vs = float(np.mean(val_hist[-cfg.VAL_SMOOTH:]))
-        tp, tt = evaluate(model, Xte, yte, cfg.BATCH); tf1, _ = macro_f1(tp, tt, C); ta = accuracy(tp, tt)
-        if use_bar: it.set_postfix(val=f"{vs:.3f}", f1=f"{tf1:.3f}", pat=pc)
-        if vs > best_val + 1e-4:
-            best_val, pc = vs, 0
-            best = {"f1": tf1, "acc": ta, "preds": tp.tolist(), "trues": tt.tolist()}
-        else:
-            pc += 1
-        if pc >= cfg.PATIENCE: break
-    if use_bar: it.close()
-    best["params"] = count_params(model); best["macs"] = count_macs_cnn(model)
-    return best
-
-print("\n" + "═"*78 + "\n CNN BASELINE on the same split (seeds " + str(cfg.REEVAL_SEEDS) + ")\n" + "═"*78)
-CNN_PATH = RUN_DIR / "cnn.json"
-cnn = json.loads(CNN_PATH.read_text()) if CNN_PATH.exists() else {}
-for s in cfg.REEVAL_SEEDS:
-    k = f"cnn:{s}"
-    if k in cnn: continue
-    print(f"\n[cnn seed {s}]", flush=True)
-    r = cnn_train_eval(s); cnn[k] = r; CNN_PATH.write_text(json.dumps(cnn))
-    print(f"   cnn:{s}  F1={r['f1']:.4f} acc={r['acc']:.4f} params={r['params']} macs={r['macs']}", flush=True)
-cnn_f1 = [cnn[f"cnn:{s}"]["f1"] for s in cfg.REEVAL_SEEDS if f"cnn:{s}" in cnn]
-cnn_acc = [cnn[f"cnn:{s}"]["acc"] for s in cfg.REEVAL_SEEDS if f"cnn:{s}" in cnn]
-cnn_params = cnn[f"cnn:{cfg.REEVAL_SEEDS[0]}"]["params"]; cnn_macs = cnn[f"cnn:{cfg.REEVAL_SEEDS[0]}"]["macs"]
-print(f"\n   CNN  F1 {np.mean(cnn_f1):.4f}±{np.std(cnn_f1):.4f}  acc {np.mean(cnn_acc):.4f}  "
-      f"params {cnn_params}  macs {cnn_macs/1e6:.2f}M", flush=True)
-
-print("\n[BOOTSTRAP vs CNN] (informational; CNN is a different, dense model class)")
-for a in [x for x in cfg.ARCHS if x in ("doppler", "lif", "plif")]:
-    for label, mfn in [("F1", METRICS["macro_f1"]), ("acc", METRICS["accuracy"])]:
-        per_seed = []
-        for s in cfg.REEVAL_SEEDS:
-            ka, kc = f"{a}:best_f1:{s}", f"cnn:{s}"
-            if ka in reeval and kc in cnn:
-                pa = np.array(reeval[ka]["preds"]); pc_ = np.array(cnn[kc]["preds"]); tr = np.array(reeval[ka]["trues"])
-                per_seed.append(paired_bootstrap(pa, pc_, tr, mfn, C))
-        if not per_seed: continue
-        mean = float(np.mean([x[0] for x in per_seed]))
-        cis = [(round(lo, 3), round(hi, 3)) for _, lo, hi in per_seed]
-        consistent = all(lo > 0 for _, lo, _ in per_seed) or all(hi < 0 for _, _, hi in per_seed)
-        boot[f"{a}-cnn[{label}]"] = {"mean": mean, "cis": cis, "consistent": consistent}
-        print(f"   {a} - cnn [{label}]: mean {mean:+.4f}  CIs {cis}  consistent={consistent}")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Energy proxy  (SynOps + estimated 45nm energy/inference; rough, documented model)
-# ══════════════════════════════════════════════════════════════════════════════
-# T=64 timesteps (one per Doppler-time slice). Layer-1 = dense MAC (analog input);
-# layers 2..L = spike-driven accumulates (AC) gated by mean firing. 45nm Horowitz:
-# E_MAC=4.6 pJ (32b mult-add), E_AC=0.9 pJ (32b add). Ignores memory movement and
-# input encoding; this is a RELATIVE comparison, not absolute silicon energy.
-E_MAC, E_AC, T = 4.6e-12, 0.9e-12, Fin
-def snn_energy(W, L, firing):
-    macs = Fin*W*T + W*C                        # layer-1 dense + readout
-    syn  = (L-1)*(firing*W*W*T)                 # spike-driven hidden layers
-    return macs, syn, macs*E_MAC + syn*E_AC
-
-print("\n" + "═"*78 + "\n ENERGY PROXY  (per inference; 45nm estimate, relative only)\n" + "═"*78)
-energy = {}
-for a in [x for x in cfg.ARCHS if x in ("doppler", "lif", "plif")]:
-    ca = selected[a]["best_f1"]; W, L = ca["W"], ca["L"]; fr = final[a]["firing_mean"]
-    macs, syn, E = snn_energy(W, L, fr)
-    energy[a] = {"macs": macs, "synops": syn, "nJ": E*1e9, "W": W, "L": L, "firing": fr}
-    print(f"   {a:<9} W={W} L={L} fire={fr:.3f}  MAC={macs/1e6:.2f}M  SynOps={syn/1e6:.2f}M  ~{E*1e9:.1f} nJ")
-cnn_E = cnn_macs*E_MAC
-energy["cnn"] = {"macs": cnn_macs, "synops": 0, "nJ": cnn_E*1e9}
-print(f"   {'cnn':<9} (dense)        MAC={cnn_macs/1e6:.2f}M  SynOps=0.00M       ~{cnn_E*1e9:.1f} nJ")
-if "doppler" in energy:
-    print(f"\n   energy ratio  CNN / Doppler = {cnn_E/(energy['doppler']['nJ']*1e-9):.1f}x  "
-          f"(Doppler {energy['doppler']['nJ']:.1f} nJ vs CNN {cnn_E*1e9:.1f} nJ)")
-
 # ── save ──────────────────────────────────────────────────────────────────────
 summary = {"run_dir": str(RUN_DIR), "archs": cfg.ARCHS, "n_trials": cfg.N_TRIALS,
            "reeval_seeds": cfg.REEVAL_SEEDS, "search_space": {
@@ -644,9 +503,6 @@ summary = {"run_dir": str(RUN_DIR), "archs": cfg.ARCHS, "n_trials": cfg.N_TRIALS
                "lr": [cfg.LR_LOW, cfg.LR_HIGH], "sched": cfg.SCHED_CHOICES, "surr": cfg.SURR_CHOICES,
                "fire": cfg.FIRE_CHOICES, "input": cfg.INPUT_CHOICES},
            "selected": selected, "pareto": pareto, "final": final, "bootstrap": boot,
-           "cnn": {"f1_mean": float(np.mean(cnn_f1)), "f1_std": float(np.std(cnn_f1)),
-                   "acc_mean": float(np.mean(cnn_acc)), "params": cnn_params, "macs": cnn_macs},
-           "energy": energy,
            "timestamp": datetime.now().isoformat()}
 (RUN_DIR / "summary.json").write_text(json.dumps(summary, indent=2))
 print(f"\n[DONE] summary -> {RUN_DIR / 'summary.json'}")
